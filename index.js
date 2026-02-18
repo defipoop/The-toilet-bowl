@@ -1,4 +1,4 @@
-console.log("ENV VAR CHECK:", process.env.DISCORD_TOKEN);
+
 import { Client, GatewayIntentBits } from "discord.js";
 
 const token = process.env.DISCORD_TOKEN;
