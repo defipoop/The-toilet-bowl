@@ -30,3 +30,9 @@ client.on("messageCreate", async (msg) => {
 });
 
 client.login(token);
+import http from "http";
+
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("Agent poo is alive.");
+}).listen(process.env.PORT || 3000);
