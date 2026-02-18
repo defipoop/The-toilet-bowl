@@ -7,7 +7,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.15.3",
-    
+    "discord.js": "^14.15.3"
   }
 }
