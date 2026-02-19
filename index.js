@@ -87,19 +87,26 @@ async function openPullRequest(title, headBranch, baseBranch, body) {
   return gh(`/pulls`, "POST", { title, head: headBranch, base: baseBranch, body });
 }
 
-// PR comments go through Issues API
 async function commentOnPullRequest(prNumber, body) {
   return gh(`/issues/${prNumber}/comments`, "POST", { body });
 }
 
+// MERGE
+async function mergePullRequest(prNumber) {
+  return gh(`/pulls/${prNumber}/merge`, "PUT", {
+    merge_method: "squash"
+  });
+}
+
 function questsText() {
   return `🧠 Daily Build Quests
-Say: "approve 1/2/3" → reply normally → I create an issue.
-Then say: "build now" → I open a starter PR + comment summary + self-review.
+approve 1/2/3 → reply normally → issue created
+build now → PR created
+merge → merges the latest PR I created
 
-1) (S) Ok Computer microsite
-2) (M) Mini clicker game
-3) (S) Context viewer webpage`;
+1) microsite
+2) clicker
+3) context viewer`;
 }
 
 async function postDailyQuests() {
@@ -112,6 +119,9 @@ async function postDailyQuests() {
 let awaitingAnswerForQuest = null;
 let lastIssue = null; // { number, url, quest, answer }
 let buildInProgress = false;
+
+// track latest PR created by the bot
+let lastPr = null; // { number, url }
 
 function starterFilesForQuest(n, answer) {
   if (n === 1) {
@@ -229,29 +239,24 @@ pre{white-space:pre-wrap;background:#111;color:#eee;padding:16px;border-radius:8
   };
 }
 
-function prSummaryText(prUrl) {
-  return `### ✅ What I did
-- Created starter files for the approved quest
-- Kept scope intentionally small (starter scaffolding)
+function prSummaryText(prUrl, quest, issueUrl) {
+  return `### ✅ Summary
+- Starter scaffolding for Quest ${quest}
+- Linked to: ${issueUrl}
 
-### 🗂️ Files added
+### 🗂️ Files
 - /apps/... (starter HTML/CSS/JS)
 - README_AGENT.md
-
-### ▶️ How to run
-Open the relevant \`index.html\` file in a browser (or serve the repo with any static server).
 
 PR: ${prUrl}`;
 }
 
 function prSelfReviewChecklist() {
   return `### 🤖 Self-review
-- [ ] The build matches the approved quest + your answer
-- [ ] No secrets/tokens committed
-- [ ] Files are in the right folders
-- [ ] JS runs without console errors
-- [ ] Naming is consistent
-- [ ] Next improvement noted for v2`;
+- [ ] Matches approved quest + answer
+- [ ] No secrets committed
+- [ ] Runs without console errors
+- [ ] Clear next step for v2`;
 }
 
 client.once("ready", async () => {
@@ -269,6 +274,23 @@ client.on("messageCreate", async (msg) => {
 
   if (text === "ping") {
     await msg.reply("pong ✅");
+    return;
+  }
+
+  // merge latest PR
+  if (text === "merge") {
+    if (!lastPr) {
+      await msg.reply("No PR to merge yet. Use `build now` first.");
+      return;
+    }
+    await msg.reply(`Merging PR #${lastPr.number}…`);
+    try {
+      await mergePullRequest(lastPr.number);
+      await msg.reply(`✅ Merged: ${lastPr.url}`);
+      lastPr = null; // clear
+    } catch (err) {
+      await msg.reply(`❌ Merge failed:\n${err.message}`);
+    }
     return;
   }
 
@@ -343,24 +365,18 @@ client.on("messageCreate", async (msg) => {
         `Starter implementation for issue #${lastIssue.number}\n\nIssue: ${lastIssue.url}`
       );
 
-      // PR comments
-      await commentOnPullRequest(pr.number, prSummaryText(pr.html_url));
+      await commentOnPullRequest(pr.number, prSummaryText(pr.html_url, lastIssue.quest, lastIssue.url));
       await commentOnPullRequest(pr.number, prSelfReviewChecklist());
 
-      await msg.reply(`✅ PR opened + commented:\n${pr.html_url}`);
+      lastPr = { number: pr.number, url: pr.html_url };
+
+      await msg.reply(`✅ PR opened:\n${pr.html_url}\n\nType \`merge\` to merge it.`);
     } catch (err) {
       await msg.reply(`❌ Build failed:\n${err.message}`);
     } finally {
       buildInProgress = false;
     }
     return;
-  }
-
-  if (text.includes("help") || text.includes("what now") || text.includes("next")) {
-    await msg.reply(
-      `Say "approve 1/2/3". After you answer, I create an issue.\nThen say "build now" to open a starter PR.\n` +
-      (lastIssue ? `Last issue: ${lastIssue.url}` : "")
-    );
   }
 });
 
