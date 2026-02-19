@@ -24,6 +24,7 @@ const client = new Client({
   ]
 });
 
+// -------------------- GitHub helpers --------------------
 async function gh(path, method = "GET", bodyObj = null) {
   if (!GITHUB_TOKEN || !REPO_NAME) throw new Error("Missing GITHUB_TOKEN or REPO_NAME.");
 
@@ -46,10 +47,6 @@ async function gh(path, method = "GET", bodyObj = null) {
     throw new Error(`${res.status} ${res.statusText}\n${typeof data === "string" ? data : JSON.stringify(data)}`);
   }
   return data;
-}
-
-async function createGithubIssue(title, body) {
-  return gh(`/issues`, "POST", { title, body });
 }
 
 async function getDefaultBranch() {
@@ -83,6 +80,17 @@ async function upsertFile(branch, path, content, message) {
   return gh(`/contents/${encodeURIComponent(path)}`, "PUT", payload);
 }
 
+async function readFile(branch, path) {
+  const obj = await gh(`/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`, "GET");
+  const b64 = obj.content?.replace(/\n/g, "") || "";
+  const txt = Buffer.from(b64, "base64").toString("utf8");
+  return { text: txt, sha: obj.sha };
+}
+
+async function createGithubIssue(title, body) {
+  return gh(`/issues`, "POST", { title, body });
+}
+
 async function openPullRequest(title, headBranch, baseBranch, body) {
   return gh(`/pulls`, "POST", { title, head: headBranch, base: baseBranch, body });
 }
@@ -91,13 +99,53 @@ async function commentOnPullRequest(prNumber, body) {
   return gh(`/issues/${prNumber}/comments`, "POST", { body });
 }
 
-// MERGE
 async function mergePullRequest(prNumber) {
-  return gh(`/pulls/${prNumber}/merge`, "PUT", {
-    merge_method: "squash"
-  });
+  return gh(`/pulls/${prNumber}/merge`, "PUT", { merge_method: "squash" });
 }
 
+// -------------------- Persistent state --------------------
+const STATE_BRANCH = "agent-state";
+const STATE_PATH = "agent_state.json";
+
+let state = {
+  awaitingAnswerForQuest: null, // 1/2/3
+  lastIssue: null,             // { number, url, quest, answer }
+  lastPr: null                 // { number, url }
+};
+
+async function ensureStateBranch() {
+  try {
+    await getBranchSha(STATE_BRANCH);
+    return;
+  } catch {
+    const base = await getDefaultBranch();
+    await createBranch(STATE_BRANCH, base);
+  }
+}
+
+async function loadState() {
+  await ensureStateBranch();
+  try {
+    const { text } = await readFile(STATE_BRANCH, STATE_PATH);
+    const parsed = JSON.parse(text);
+    // only accept known keys
+    state.awaitingAnswerForQuest = parsed.awaitingAnswerForQuest ?? null;
+    state.lastIssue = parsed.lastIssue ?? null;
+    state.lastPr = parsed.lastPr ?? null;
+    console.log("State loaded:", JSON.stringify(state));
+  } catch {
+    // First run: create file
+    await saveState("agent: init state");
+  }
+}
+
+async function saveState(message = "agent: save state") {
+  await ensureStateBranch();
+  const safe = JSON.stringify(state, null, 2);
+  await upsertFile(STATE_BRANCH, STATE_PATH, safe, message);
+}
+
+// -------------------- Quests / content --------------------
 function questsText() {
   return `🧠 Daily Build Quests
 approve 1/2/3 → reply normally → issue created
@@ -115,13 +163,6 @@ async function postDailyQuests() {
   if (!ch) return;
   await ch.send(questsText());
 }
-
-let awaitingAnswerForQuest = null;
-let lastIssue = null; // { number, url, quest, answer }
-let buildInProgress = false;
-
-// track latest PR created by the bot
-let lastPr = null; // { number, url }
 
 function starterFilesForQuest(n, answer) {
   if (n === 1) {
@@ -259,10 +300,13 @@ function prSelfReviewChecklist() {
 - [ ] Clear next step for v2`;
 }
 
+// -------------------- Bot logic --------------------
+let buildInProgress = false;
+
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  await postDailyQuests();
-  setInterval(postDailyQuests, 24 * 60 * 60 * 1000);
+  await loadState();          // << persistence
+  await postDailyQuests();    // single post on boot
 });
 
 client.on("messageCreate", async (msg) => {
@@ -277,27 +321,39 @@ client.on("messageCreate", async (msg) => {
     return;
   }
 
-  // merge latest PR
+  if (text === "status") {
+    await msg.reply(
+      `State:\nawaitingAnswerForQuest=${state.awaitingAnswerForQuest ?? "null"}\n` +
+      `lastIssue=${state.lastIssue?.url ?? "null"}\n` +
+      `lastPr=${state.lastPr?.url ?? "null"}`
+    );
+    return;
+  }
+
+  // merge
   if (text === "merge") {
-    if (!lastPr) {
+    if (!state.lastPr) {
       await msg.reply("No PR to merge yet. Use `build now` first.");
       return;
     }
-    await msg.reply(`Merging PR #${lastPr.number}…`);
+    await msg.reply(`Merging PR #${state.lastPr.number}…`);
     try {
-      await mergePullRequest(lastPr.number);
-      await msg.reply(`✅ Merged: ${lastPr.url}`);
-      lastPr = null; // clear
+      await mergePullRequest(state.lastPr.number);
+      await msg.reply(`✅ Merged: ${state.lastPr.url}`);
+      state.lastPr = null;
+      await saveState("agent: cleared lastPr after merge");
     } catch (err) {
       await msg.reply(`❌ Merge failed:\n${err.message}`);
     }
     return;
   }
 
+  // approve N
   const approveMatch = text.match(/^approve\s+([123])$/);
   if (approveMatch) {
     const n = Number(approveMatch[1]);
-    awaitingAnswerForQuest = n;
+    state.awaitingAnswerForQuest = n;
+    await saveState(`agent: awaiting answer for quest ${n}`);
 
     const q =
       n === 1 ? "Quick choice: BNKR orange/black vibe or retro terminal?"
@@ -308,9 +364,11 @@ client.on("messageCreate", async (msg) => {
     return;
   }
 
-  if (awaitingAnswerForQuest) {
-    const n = awaitingAnswerForQuest;
-    awaitingAnswerForQuest = null;
+  // answer capture
+  if (state.awaitingAnswerForQuest) {
+    const n = state.awaitingAnswerForQuest;
+    state.awaitingAnswerForQuest = null;
+    await saveState(`agent: got answer for quest ${n}`);
 
     await msg.reply("🛠️ Creating GitHub issue…");
     try {
@@ -318,7 +376,9 @@ client.on("messageCreate", async (msg) => {
         `Quest ${n}: Build`,
         `Quest: ${n}\nUser answer: ${raw}\n\nNext: say "build now" to generate a starter PR.`
       );
-      lastIssue = { number: issue.number, url: issue.html_url, quest: n, answer: raw };
+      state.lastIssue = { number: issue.number, url: issue.html_url, quest: n, answer: raw };
+      await saveState(`agent: set lastIssue #${issue.number}`);
+
       await msg.reply(`✅ Issue created:\n${issue.html_url}\n\nWhen ready: type "build now"`);
     } catch (err) {
       await msg.reply(`❌ GitHub error:\n${err.message}`);
@@ -326,12 +386,13 @@ client.on("messageCreate", async (msg) => {
     return;
   }
 
+  // build now
   if (text === "build now") {
     if (buildInProgress) {
       await msg.reply("⏳ Build already running.");
       return;
     }
-    if (!lastIssue) {
+    if (!state.lastIssue) {
       await msg.reply('No issue yet. Do "approve 1/2/3" first.');
       return;
     }
@@ -339,36 +400,37 @@ client.on("messageCreate", async (msg) => {
     buildInProgress = true;
     try {
       const base = await getDefaultBranch();
-      const branch = `agent/quest-${lastIssue.quest}-issue-${lastIssue.number}`;
+      const branch = `agent/quest-${state.lastIssue.quest}-issue-${state.lastIssue.number}`;
 
       await msg.reply(`🧱 Building starter PR on \`${branch}\`…`);
 
       await createBranch(branch, base);
 
-      const starter = starterFilesForQuest(lastIssue.quest, lastIssue.answer);
+      const starter = starterFilesForQuest(state.lastIssue.quest, state.lastIssue.answer);
 
       await upsertFile(
         branch,
         "README_AGENT.md",
-        `# Agent Builds\n\nLatest build: Quest ${lastIssue.quest}\nIssue: ${lastIssue.url}\n`,
-        `agent: add README_AGENT for issue #${lastIssue.number}`
+        `# Agent Builds\n\nLatest build: Quest ${state.lastIssue.quest}\nIssue: ${state.lastIssue.url}\n`,
+        `agent: add README_AGENT for issue #${state.lastIssue.number}`
       );
 
       for (const [path, content] of Object.entries(starter.files)) {
-        await upsertFile(branch, path, content, `agent: start quest ${lastIssue.quest} (issue #${lastIssue.number})`);
+        await upsertFile(branch, path, content, `agent: start quest ${state.lastIssue.quest} (issue #${state.lastIssue.number})`);
       }
 
       const pr = await openPullRequest(
-        `Quest ${lastIssue.quest} starter (issue #${lastIssue.number})`,
+        `Quest ${state.lastIssue.quest} starter (issue #${state.lastIssue.number})`,
         branch,
         base,
-        `Starter implementation for issue #${lastIssue.number}\n\nIssue: ${lastIssue.url}`
+        `Starter implementation for issue #${state.lastIssue.number}\n\nIssue: ${state.lastIssue.url}`
       );
 
-      await commentOnPullRequest(pr.number, prSummaryText(pr.html_url, lastIssue.quest, lastIssue.url));
+      await commentOnPullRequest(pr.number, prSummaryText(pr.html_url, state.lastIssue.quest, state.lastIssue.url));
       await commentOnPullRequest(pr.number, prSelfReviewChecklist());
 
-      lastPr = { number: pr.number, url: pr.html_url };
+      state.lastPr = { number: pr.number, url: pr.html_url };
+      await saveState(`agent: set lastPr #${pr.number}`);
 
       await msg.reply(`✅ PR opened:\n${pr.html_url}\n\nType \`merge\` to merge it.`);
     } catch (err) {
@@ -377,6 +439,15 @@ client.on("messageCreate", async (msg) => {
       buildInProgress = false;
     }
     return;
+  }
+
+  // help
+  if (text.includes("help") || text.includes("what now") || text.includes("next")) {
+    await msg.reply(
+      `approve 1/2/3 → answer normally → issue\nbuild now → PR\nmerge → merge latest PR\n` +
+      (state.lastIssue ? `Last issue: ${state.lastIssue.url}\n` : "") +
+      (state.lastPr ? `Last PR: ${state.lastPr.url}` : "")
+    );
   }
 });
 
