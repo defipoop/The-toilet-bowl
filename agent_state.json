@@ -1,5 +1,10 @@
 {
   "awaitingAnswerForQuest": null,
-  "lastIssue": null,
+  "lastIssue": {
+    "number": 10,
+    "url": "https://github.com/defipoop/The-toilet-bowl/issues/10",
+    "quest": 1,
+    "answer": "Retro"
+  },
   "lastPr": null
 }
