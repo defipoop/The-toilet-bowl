@@ -128,13 +128,11 @@ async function loadState() {
   try {
     const { text } = await readFile(STATE_BRANCH, STATE_PATH);
     const parsed = JSON.parse(text);
-    // only accept known keys
     state.awaitingAnswerForQuest = parsed.awaitingAnswerForQuest ?? null;
     state.lastIssue = parsed.lastIssue ?? null;
     state.lastPr = parsed.lastPr ?? null;
     console.log("State loaded:", JSON.stringify(state));
   } catch {
-    // First run: create file
     await saveState("agent: init state");
   }
 }
@@ -143,6 +141,67 @@ async function saveState(message = "agent: save state") {
   await ensureStateBranch();
   const safe = JSON.stringify(state, null, 2);
   await upsertFile(STATE_BRANCH, STATE_PATH, safe, message);
+}
+
+// -------------------- Auto-import (bootstraps state) --------------------
+function extractIssueUrlFromPrBody(body) {
+  if (!body) return null;
+  const m = body.match(/Issue:\s*(https:\/\/github\.com\/[^\s]+)/i);
+  return m ? m[1] : null;
+}
+
+function extractIssueNumberFromUrl(url) {
+  if (!url) return null;
+  const m = url.match(/\/issues\/(\d+)(\b|$)/i);
+  return m ? Number(m[1]) : null;
+}
+
+function inferQuestFromPrTitle(title) {
+  // "Quest 1 starter (issue #6)"
+  if (!title) return null;
+  const m = title.match(/quest\s+(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
+
+async function autoImportFromGitHubIfEmpty() {
+  // Only do this if state is empty
+  if (state.lastPr || state.lastIssue) return;
+
+  try {
+    // Look for most recent open PRs
+    const prs = await gh(`/pulls?state=open&sort=created&direction=desc&per_page=20`, "GET");
+
+    // Prefer PRs created by our bot naming conventions
+    const pr = prs.find(p =>
+      (p.title && /quest\s+\d+/i.test(p.title)) ||
+      (p.head?.ref && p.head.ref.startsWith("agent/"))
+    );
+
+    if (!pr) {
+      console.log("Auto-import: no matching open PR found.");
+      return;
+    }
+
+    state.lastPr = { number: pr.number, url: pr.html_url };
+
+    const issueUrl = extractIssueUrlFromPrBody(pr.body);
+    const issueNum = extractIssueNumberFromUrl(issueUrl);
+    const quest = inferQuestFromPrTitle(pr.title);
+
+    if (issueUrl && issueNum) {
+      state.lastIssue = {
+        number: issueNum,
+        url: issueUrl,
+        quest: quest ?? null,
+        answer: "(imported)"
+      };
+    }
+
+    await saveState(`agent: auto-imported PR #${pr.number}`);
+    console.log("Auto-imported:", JSON.stringify(state));
+  } catch (err) {
+    console.log("Auto-import failed:", err.message);
+  }
 }
 
 // -------------------- Quests / content --------------------
@@ -305,8 +364,11 @@ let buildInProgress = false;
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  await loadState();          // << persistence
-  await postDailyQuests();    // single post on boot
+
+  await loadState();
+  await autoImportFromGitHubIfEmpty(); // << NEW
+
+  await postDailyQuests();
 });
 
 client.on("messageCreate", async (msg) => {
@@ -330,7 +392,6 @@ client.on("messageCreate", async (msg) => {
     return;
   }
 
-  // merge
   if (text === "merge") {
     if (!state.lastPr) {
       await msg.reply("No PR to merge yet. Use `build now` first.");
@@ -348,7 +409,6 @@ client.on("messageCreate", async (msg) => {
     return;
   }
 
-  // approve N
   const approveMatch = text.match(/^approve\s+([123])$/);
   if (approveMatch) {
     const n = Number(approveMatch[1]);
@@ -364,7 +424,6 @@ client.on("messageCreate", async (msg) => {
     return;
   }
 
-  // answer capture
   if (state.awaitingAnswerForQuest) {
     const n = state.awaitingAnswerForQuest;
     state.awaitingAnswerForQuest = null;
@@ -386,7 +445,6 @@ client.on("messageCreate", async (msg) => {
     return;
   }
 
-  // build now
   if (text === "build now") {
     if (buildInProgress) {
       await msg.reply("⏳ Build already running.");
@@ -439,15 +497,6 @@ client.on("messageCreate", async (msg) => {
       buildInProgress = false;
     }
     return;
-  }
-
-  // help
-  if (text.includes("help") || text.includes("what now") || text.includes("next")) {
-    await msg.reply(
-      `approve 1/2/3 → answer normally → issue\nbuild now → PR\nmerge → merge latest PR\n` +
-      (state.lastIssue ? `Last issue: ${state.lastIssue.url}\n` : "") +
-      (state.lastPr ? `Last PR: ${state.lastPr.url}` : "")
-    );
   }
 });
 
