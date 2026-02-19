@@ -1,5 +1,5 @@
 {
-  "awaitingAnswerForQuest": null,
+  "awaitingAnswerForQuest": 1,
   "lastIssue": null,
   "lastPr": null
 }
